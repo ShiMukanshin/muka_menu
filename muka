@@ -1,0 +1,189 @@
+
+#!/data/data/com.termux/files/usr/bin/bash
+# === MUKA v6.1 — мини‑OS для Termux ===
+# без зависимостей qrencode/lolcat; есть HTTP BasicAuth и полное файловое меню
+
+VERSION="6.1"
+SAVE_DIR="/sdcard/MUKA"
+NOTES_FILE="$SAVE_DIR/notes.txt"
+mkdir -p "$SAVE_DIR"
+
+# ---------- helpers ----------
+_pause(){ read -p "Enter..." _; }
+_has(){ command -v "$1" >/dev/null 2>&1; }
+_need(){ _has "$1" || { echo "Нужен пакет '$1'. Устанавливаю..."; pkg install -y "$1"; }; }
+ip_local(){
+  ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 \
+  || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'
+}
+
+# Просмотр файла красиво (если есть bat)
+view_file(){
+  local f="$1"
+  [ -f "$f" ] || { echo "Файл не найден: $f"; return 1; }
+  if _has bat; then bat -n --paging=always "$f"; else less -R "$f"; fi
+}
+
+# Выбор пути (если есть fzf — интерактивно)
+pick_path(){
+  if _has fzf; then
+    local p
+    p="$(find . -maxdepth 1 -mindepth 1 | sed 's|^\./||' | fzf --prompt='Выбери → ' --height=80% --border)"
+    echo "$p"
+  else
+    read -p "Путь: " p; echo "$p"
+  fi
+}
+
+# QR-код через python (pip поставится сам при первом запуске)
+mkqr_py(){
+  local text="$1"
+  python - "$text" <<'PY'
+import sys, os, time, subprocess
+txt = sys.argv[1]
+try:
+    import qrcode  # noqa
+except Exception:
+    subprocess.check_call([sys.executable,"-m","pip","install","-q","qrcode[pil]"])
+    import qrcode  # noqa
+outdir = "/sdcard/MUKA"; os.makedirs(outdir, exist_ok=True)
+name = "qr_" + time.strftime("%Y%m%d_%H%M%S") + ".png"
+path = os.path.join(outdir, name)
+qrcode.make(txt).save(path)
+print(f"QR сохранён: {path}")
+PY
+}
+
+# HTTP с BasicAuth (всё внутри, без внешних файлов)
+serve_auth_py(){
+  local port="$1" dir="$2" user="$3" pass="$4"
+  python - "$port" "$dir" "$user" "$pass" <<'PY'
+import sys, base64, http.server, socketserver, functools, os
+port = int(sys.argv[1]); directory=sys.argv[2]; user=sys.argv[3]; password=sys.argv[4]
+token = base64.b64encode(f"{user}:{password}".encode()).decode()
+class AuthHandler(http.server.SimpleHTTPRequestHandler):
+    def do_HEAD(self): return self._auth(lambda: super().do_HEAD())
+    def do_GET(self):  return self._auth(lambda: super().do_GET())
+    def list_directory(self, path): return super().list_directory(path)
+    def _auth(self, ok):
+        a=self.headers.get("Authorization","")
+        if not a.startswith("Basic ") or a.split(" ",1)[1]!=token:
+            self.send_response(401); self.send_header("WWW-Authenticate",'Basic realm="MUKA"'); self.end_headers()
+            self.wfile.write(b"Unauthorized"); return
+        return ok()
+Handler = functools.partial(AuthHandler, directory=directory)
+with socketserver.TCPServer(("0.0.0.0", port), Handler) as httpd:
+    print(f"Serving {directory} on http://0.0.0.0:{port}  (BasicAuth)")
+    try: httpd.serve_forever()
+    except KeyboardInterrupt: pass
+PY
+}
+
+# ---------- файловое подменю ----------
+files_menu(){
+  local loop=1
+  while [ $loop -eq 1 ]; do
+    clear
+    echo "=== Работа с файлами — $(pwd) ==="
+    echo "1) Открыть файловый менеджер (ranger)"
+    echo "2) Список (ls -alh)"
+    echo "3) Перейти в папку (cd)"
+    echo "4) Просмотреть файл"
+    echo "5) Редактировать файл (nano)"
+    echo "6) Копировать (cp -riv)"
+    echo "7) Переместить / Переименовать (mv -iv)"
+    echo "8) Удалить (rm -riv)"
+    echo "9) Создать папку (mkdir -p)"
+    echo "10) Архивировать в ZIP"
+    echo "11) Разархивировать ZIP"
+    echo "12) Найти файл по имени (find)"
+    echo "13) Поиск текста внутри файлов (ripgrep/grep -R)"
+    echo "14) Размеры (du -sh * | sort -h)"
+    echo "15) Показать текущий путь (pwd)"
+    echo "0) Назад"
+    read -p "Выбор: " a
+    case "$a" in
+      1) _need ranger; ranger ;;
+      2) ls -alh; _pause ;;
+      3) read -p "Куда перейти: " d; cd "$d" 2>/dev/null || { echo "Нет такой папки"; _pause; } ;;
+      4) f="$(pick_path)"; [ -n "$f" ] && view_file "$f";;
+      5) f="$(pick_path)"; [ -n "$f" ] && { _need nano; nano "$f"; };;
+      6) echo "Источник:"; s="$(pick_path)"; [ -z "$s" ] || { read -p "Куда: " d; cp -riv "$s" "$d"; _pause; } ;;
+      7) echo "Источник:"; s="$(pick_path)"; [ -z "$s" ] || { read -p "Новое имя/путь: " d; mv -iv "$s" "$d"; _pause; } ;;
+      8) echo "Удалить:";    s="$(pick_path)"; [ -n "$s" ] && { rm -riv "$s"; _pause; } ;;
+      9) read -p "Имя папки: " d; mkdir -p "$d";;
+      10) echo "Что упаковать:"; p="$(pick_path)"; [ -z "$p" ] || { _need zip; read -p "Имя архива (без .zip): " z; zip -r "${z%.zip}.zip" "$p"; _pause; } ;;
+      11) echo "ZIP архив:"; z="$(pick_path)"; [ -z "$z" ] || { _need unzip; unzip "$z"; _pause; } ;;
+      12) read -p "Шаблон (например *.mp3 или часть имени): " pat; find . -iname "*$pat*" -print; _pause ;;
+      13) read -p "Искать текст: " q; if _has rg; then rg -n "$q"; else grep -RIn --color=auto "$q" .; fi; _pause ;;
+      14) du -sh -- * 2>/dev/null | sort -h; _pause ;;
+      15) pwd; _pause ;;
+      0) loop=0 ;;
+      *) echo "Неизвестный пункт"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- мини HTTP‑сервер (меню) ----------
+serve_menu(){
+  read -p "Порт [8000]: " p; p=${p:-8000}
+  read -p "Папка для раздачи [текущая]: " d; d=${d:-$PWD}
+  local ip="$(ip_local)"
+  echo "Режим:"
+  echo "1) Без пароля (python -m http.server)"
+  echo "2) С паролем (Basic Auth)"
+  read -p "Выбор: " m
+  case "$m" in
+    1) echo "URL: http://$ip:$p  (Ctrl+C — остановить)"
+       cd "$d" && python -m http.server "$p"
+       ;;
+    2) read -p "Логин: " u; read -p "Пароль: " pass
+       echo "URL: http://$u:$pass@$ip:$p  (Ctrl+C — остановить)"
+       serve_auth_py "$p" "$d" "$u" "$pass"
+       ;;
+    *) echo "Отмена"; sleep 1 ;;
+  esac
+}
+
+# ---------- main loop ----------
+while true; do
+  clear
+  echo "=== MUKA v$VERSION — мини‑OS (сохранение в $SAVE_DIR) ==="
+  echo "1) Neofetch"
+  echo "2) Сканер сети (nmap)"
+  echo "3) Создать GIF из видео (URL или файл)"
+  echo "4) Извлечь аудио в MP3 (URL или файл)"
+  echo "5) Скачать YouTube/MP3 (yt-dlp → $SAVE_DIR)"
+  echo "6) Генератор паролей"
+  echo "7) Создать QR‑код (→ $SAVE_DIR)"
+  echo "8) Заметки (nano)"
+  echo "9) Просмотр заметок"
+  echo "10) Резервное копирование Termux"
+  echo "11) Восстановление Termux"
+  echo "12) Матрица (cmatrix)"
+  echo "13) Коровка с цитатой"
+  echo "14) Мини HTTP‑сервер (python)"
+  echo "15) Работа с файлами"
+  echo "0) Выход"
+  read -p "Выбор: " ch
+
+  case "$ch" in
+    1) _need neofetch; neofetch; _pause ;;
+    2) _need nmap; read -p "IP/сеть: " target; nmap "$target"; _pause ;;
+    3) _need ffmpeg; read -p "Путь или URL к видео: " v; read -p "Имя GIF: " n; ffmpeg -y -i "$v" "$SAVE_DIR/$n.gif"; _pause ;;
+    4) _need ffmpeg; read -p "Путь или URL к видео: " v; read -p "Имя MP3: " n; ffmpeg -y -i "$v" -q:a 0 -map a "$SAVE_DIR/$n.mp3"; _pause ;;
+    5) _need yt-dlp; read -p "Ссылка YouTube: " url; yt-dlp -o "$SAVE_DIR/%(title)s.%(ext)s" "$url"; _pause ;;
+    6) read -p "Длина пароля [16]: " L; L=${L:-16}; tr -dc A-Za-z0-9_@#%+! </dev/urandom | head -c "$L"; echo; _pause ;;
+    7) read -p "Текст для QR: " q; mkqr_py "$q"; _pause ;;
+    8) _need nano; nano "$NOTES_FILE" ;;
+    9) [ -f "$NOTES_FILE" ] && view_file "$NOTES_FILE" || echo "Пока пусто: $NOTES_FILE"; _pause ;;
+    10) tar -czvf "$SAVE_DIR/termux_backup_$(date +%Y%m%d).tar.gz" "$HOME"; _pause ;;
+    11) read -p "Путь к бэкапу: " b; [ -f "$b" ] && tar -xzvf "$b" -C / || echo "Файл не найден"; _pause ;;
+    12) _need cmatrix; cmatrix ;;
+    13) if _has fortune && _has cowsay; then fortune | cowsay; else echo "Установи: pkg install fortune cowsay"; fi; _pause ;;
+    14) serve_menu ;;
+    15) files_menu ;;
+    0)  exit 0 ;;
+    *) echo "Неизвестный пункт"; sleep 1 ;;
+  esac
+done
