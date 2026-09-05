@@ -1,2 +1,3 @@
 after downloading use:
+
 curl -L https://raw.githubusercontent.com/ShiMukanshin/muka_menu/main/muka -o cd muka_menu && mv muka .. && cd .. && mv muka .. && cd .. && mv muka usr && cd usr && mv muka bin && cd bin && chmod +x muka && cd
